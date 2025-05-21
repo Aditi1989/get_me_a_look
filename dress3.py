@@ -1,3 +1,5 @@
+#WORKING CORRECT
+
 import datetime
 import random
 import re
@@ -179,10 +181,14 @@ class SmartOutfitRecommender:
         
         # Layer handling (expanded keywords)
         layer_keywords = ["layer", "jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"]
+        # --- PATCH: Add specific layer types to required ---
+        detected_layers = [kw for kw in layer_keywords if kw in prompt]
         if any(f"no {kw}" in prompt for kw in layer_keywords):
             forbidden.append("layer")
+        elif detected_layers:
+            required.extend(detected_layers)  # Add specific types like "jacket", "blazer"
         elif any(kw in prompt for kw in layer_keywords):
-            required.append("layer")
+            required.append("layer")  # Fallback to generic layer
             
         return list(set(required)), list(set(preferred)), list(set(forbidden))
 
@@ -273,7 +279,71 @@ class SmartOutfitRecommender:
                 
         return filtered
 
+    def _attach_matching_layer(self, outfit_items, category_layers, required, context):
+        """Improved layer attachment logic that always adds layer when requested or needed by context"""
+        layer_keywords = ["layer", "jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"]
+        needs_layer = (
+            any(kw in required for kw in layer_keywords) or  # User explicitly requested layer
+            context.get("needs_layer")  # Context requires layer
+        )
+
+        if not needs_layer:
+            return outfit_items
+
+        # Get ALL available layers, not just category-specific ones
+        all_layers = [item for item in self.wardrobe_db if item["category"] == "layer"]
+        
+        # 1. Prioritize specific layer types requested (e.g. "blazer")
+        specific_layer_types = [kw for kw in layer_keywords if kw in required]
+        matching_layers = []
+        
+        if specific_layer_types:
+            # First try exact matches for specific layer types
+            matching_layers = [
+                layer for layer in all_layers
+                if any(kw in layer["tags"] or kw in layer["name"].lower() 
+                       for kw in specific_layer_types)
+            ]
+
+        # 2. Fallback to occasion-appropriate layers
+        if not matching_layers:
+            outfit_tags = set(tag for item in outfit_items for tag in item.get("tags", []))
+            matching_layers = [
+                layer for layer in all_layers
+                if outfit_tags & set(layer.get("tags", []))
+            ]
+
+        # 3. Final fallback: any available layer
+        if not matching_layers and all_layers:
+            matching_layers = all_layers
+
+        # Add layer if found and not already present
+        if matching_layers and not any(item["category"] == "layer" for item in outfit_items):
+            selected_layer = random.choice(matching_layers)
+            outfit_items.append(selected_layer)
+
+        return outfit_items
+
+    def _prioritize_color_outfits(self, outfits, required_colors):
+        """Reorder outfits to show those matching required color(s) first."""
+        if not required_colors:
+            return outfits
+        color_variants = set()
+        for color in required_colors:
+            color_variants.update(self._expand_color_requirements(color))
+        matching_outfits = []
+        non_matching_outfits = []
+        for outfit in outfits:
+            tags = set(tag for item in outfit["items"] for tag in item.get("tags", []))
+            name = " ".join(item.get("name", "") for item in outfit["items"])
+            if any(color in tags or color in name.lower() for color in color_variants):
+                matching_outfits.append(outfit)
+            else:
+                non_matching_outfits.append(outfit)
+        return matching_outfits + non_matching_outfits
+
     def get_unique_outfits(self, occasions, context: Dict, required: List[str], forbidden: List[str]) -> List[Dict]:
+        formal_occasions = {"office", "business meeting", "interview"}
         # --- Inserted logic for office + ethnic/traditional/ritual/ceremony ---
         office_ethnic_keywords = {"ethnic", "traditional", "ceremony", "ritual", "festive", "puja", "cultural"}
         if (
@@ -364,6 +434,7 @@ class SmartOutfitRecommender:
                     )
                 formal_tops = [top for top in self.wardrobe_db if top["category"] == "topwear" and is_strictly_formal(top)]
                 formal_bottoms = [bottom for bottom in self.wardrobe_db if bottom["category"] == "bottomwear" and is_strictly_formal(bottom)]
+                formal_layers = [layer for layer in self.wardrobe_db if layer["category"] == "layer" and is_strictly_formal(layer)]
                 used_formal_top_ids = set([item["id"] for o in outfits for item in o["items"] if item["category"] == "topwear"])
                 used_formal_bottom_ids = set([item["id"] for o in outfits for item in o["items"] if item["category"] == "bottomwear"])
                 for _ in range(3 - len(outfits)):
@@ -375,11 +446,162 @@ class SmartOutfitRecommender:
                     bottom = random.choice(available_bottoms)
                     used_formal_top_ids.add(top["id"])
                     used_formal_bottom_ids.add(bottom["id"])
+                    outfit_items = [top, bottom]
+                    outfit_items = self._attach_matching_layer(outfit_items, formal_layers, required=[], context={})
                     outfits.append({
-                        "type": "formal_office",
-                        "items": [top, bottom],
+                        "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
+                        "items": outfit_items,
                         "reason": "Strictly formal attire (no ethnic/party/casual) for funeral"
                     })
+            return outfits[:3]
+        # --- Formal/Office/Business/Interview logic ---
+        elif any(occ in formal_occasions for occ in [o.lower() for o in occasions]):
+            # Only use items with "formal", "office", "professional", "business_meeting", "interview" tags
+            formal_tags = {"formal", "office", "professional", "business_meeting", "interview"}
+            # Exclude "funeral", "party", "fancy", "elegant", "stylish", "date", "chic", "semi_formal", "casual"
+            exclude_tags = {"funeral", "party", "fancy", "elegant", "stylish", "date", "chic", "semi_formal", "casual"}
+            def is_strictly_formal(item):
+                tags = set(item.get("tags", []))
+                return (
+                    (tags & formal_tags) and 
+                    not (tags & exclude_tags) and
+                    (item["category"] != "one_piece")  # Exclude one_pieces for formal office
+                )
+
+            formal_tops = [top for top in self.wardrobe_db 
+                          if top["category"] == "topwear" and is_strictly_formal(top)]
+            formal_bottoms = [bottom for bottom in self.wardrobe_db 
+                             if bottom["category"] == "bottomwear" and is_strictly_formal(bottom)]
+            formal_layers = [layer for layer in self.wardrobe_db 
+                            if layer["category"] == "layer" and is_strictly_formal(layer)]
+
+            outfits = []
+            used_top_ids = set()
+            used_bottom_ids = set()
+
+            for _ in range(3):
+                available_tops = [top for top in formal_tops if top["id"] not in used_top_ids]
+                available_bottoms = [bottom for bottom in formal_bottoms if bottom["id"] not in used_bottom_ids]
+                
+                if not available_tops or not available_bottoms:
+                    break
+                    
+                top = random.choice(available_tops)
+                bottom = random.choice(available_bottoms)
+                used_top_ids.add(top["id"])
+                used_bottom_ids.add(bottom["id"])
+                
+                outfit_items = [top, bottom]
+                
+                # STRICTLY FORMAL LAYER ATTACHMENT
+                if formal_layers:
+                    # Only add if not already present and we have matching formal layers
+                    if not any(item["category"] == "layer" for item in outfit_items):
+                        selected_layer = random.choice(formal_layers)
+                        outfit_items.append(selected_layer)
+                
+                outfits.append({
+                    "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
+                    "items": outfit_items,
+                    "reason": f"Formal/office outfit for {occasions}" + 
+                             (" (with formal layer)" if len(outfit_items) == 3 else "")
+                })
+
+            return outfits[:3]
+        # --- Party-related occasions (including office party, beach party, wedding, date) ---
+        party_occasions = {"office party", "party", "beach party", "wedding", "date"}
+        if any(occ in party_occasions for occ in [o.lower() for o in occasions]):
+            # Updated wedding/party logic: only use items with "party", "fancy", "elegant", "stylish", "wedding" tags (NO ethnic/ritual/festive unless user requests)
+            if "beach party" in [o.lower() for o in occasions]:
+                party_tags = {"party", "beach_party", "fancy", "elegant", "stylish"}
+            elif "wedding" in [o.lower() for o in occasions]:
+                party_tags = {"party", "fancy", "elegant", "stylish", "wedding"}
+            else:
+                party_tags = {"party", "fancy", "elegant", "stylish"}
+            # Exclude ethnic/ritual/festive unless user requests
+            exclude_ethnic = not any(x in [o.lower() for o in occasions] for x in ["ethnic", "ritual", "festive"])
+            def not_ethnic(item):
+                if not exclude_ethnic:
+                    return True
+                tags = set(item["tags"])
+                return not ({"ethnic", "ritual", "festive", "temple", "traditional"} & tags)
+            party_one_pieces = [
+                op for op in self.wardrobe_db if op["category"] == "one_piece"
+                if (not {"swimming", "swimwear"}.intersection(op["tags"]))
+                and (party_tags.intersection(op["tags"]))
+                and not_ethnic(op)
+            ]
+            party_tops = [
+                top for top in self.wardrobe_db if top["category"] == "topwear"
+                if party_tags.intersection(top["tags"]) and not_ethnic(top)
+            ]
+            party_bottoms = [
+                bottom for bottom in self.wardrobe_db if bottom["category"] == "bottomwear"
+                if party_tags.intersection(bottom["tags"]) and not_ethnic(bottom)
+            ]
+            party_layers = [
+                layer for layer in self.wardrobe_db if layer["category"] == "layer"
+                if party_tags.intersection(layer["tags"]) and not_ethnic(layer)
+            ]
+            outfits = []
+            # 1. Top+Bottom (+Layer if requested)
+            used_top_ids = set()
+            used_bottom_ids = set()
+            for _ in range(2):
+                available_tops = [top for top in party_tops if top["id"] not in used_top_ids]
+                available_bottoms = [bottom for bottom in party_bottoms if bottom["id"] not in used_bottom_ids]
+                if not available_tops or not available_bottoms:
+                    break
+                top = random.choice(available_tops)
+                bottom = random.choice(available_bottoms)
+                used_top_ids.add(top["id"])
+                used_bottom_ids.add(bottom["id"])
+                outfit_items = [top, bottom]
+                # Attach layer if needed (universal helper)
+                outfit_items = self._attach_matching_layer(outfit_items, party_layers, required, context)
+                outfits.append({
+                    "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
+                    "items": outfit_items,
+                    "reason": f"Stylish combination for {occasions}" + (" (with layer)" if len(outfit_items) == 3 else "")
+                })
+                self.recent_outfits["tops"].append(top["id"])
+                self.recent_outfits["bottoms"].append(bottom["id"])
+                if len(self.recent_outfits["tops"]) > self.max_recent_outfits:
+                    self.recent_outfits["tops"].pop(0)
+                if len(self.recent_outfits["bottoms"]) > self.max_recent_outfits:
+                    self.recent_outfits["bottoms"].pop(0)
+            # 2. One-piece (+Layer if requested)
+            if party_one_pieces:
+                available_one_pieces = [
+                    op for op in party_one_pieces
+                    if op["id"] not in self.recent_outfits.get("one_piece", [])
+                ]
+                if not available_one_pieces:
+                    available_one_pieces = party_one_pieces
+                selected_one_piece = random.choice(available_one_pieces)
+                outfit_items = [selected_one_piece]
+                # Attach layer if needed (universal helper)
+                outfit_items = self._attach_matching_layer(outfit_items, party_layers, required, context)
+                outfits.insert(0, {  # Insert one-piece as first outfit
+                    "type": "one_piece+layer" if len(outfit_items) == 2 else "one_piece",
+                    "items": outfit_items,
+                    "reason": f"Elegant one-piece for {occasions}" + (" (with layer)" if len(outfit_items) == 2 else "")
+                })
+                self.recent_outfits["one_piece"].append(selected_one_piece["id"])
+                if len(self.recent_outfits["one_piece"]) > self.max_recent_outfits:
+                    self.recent_outfits["one_piece"].pop(0)
+            # After generating the party outfits, ensure layers are attached if requested
+            if any(kw in required for kw in ["layer", "blazer", "jacket"]):
+                party_layers = [item for item in self.wardrobe_db 
+                                if item["category"] == "layer" and 
+                                ("blazer" in item["tags"] or "jacket" in item["tags"])]
+                for outfit in outfits:
+                    # Only add layer if not already present and we have matching layers
+                    if not any(item["category"] == "layer" for item in outfit["items"]) and party_layers:
+                        selected_layer = random.choice(party_layers)
+                        outfit["items"].append(selected_layer)
+                        outfit["type"] = outfit.get("type", "") + "+layer"
+                        outfit["reason"] = outfit.get("reason", "") + " (with blazer)"
             return outfits[:3]
         # --- Existing logic ---
         occasion_items = self.filter_items_by_occasion(occasions)
@@ -485,23 +707,7 @@ class SmartOutfitRecommender:
                 if ritual_one_pieces:
                     selected_one_piece = random.choice(ritual_one_pieces)
                     outfit_items = [selected_one_piece]
-                    if (
-                        "layer" in required or "jacket" in required or "coat" in required or "blazer" in required or "sweater" in required or "cardigan" in required
-                        or context.get("needs_layer")
-                    ):
-                        if ritual_layers:
-                            matching_layers = [
-                                layer for layer in ritual_layers
-                                if set(layer["tags"]) & set(selected_one_piece["tags"])
-                            ]
-                            specific_layer_types = [kw for kw in ["jacket", "blazer", "sweater", "coat", "cardigan"] if kw in required]
-                            if specific_layer_types:
-                                matching_layers = [layer for layer in ritual_layers if any(kw in layer["tags"] for kw in specific_layer_types)]
-                            if matching_layers:
-                                layer = random.choice(matching_layers)
-                            else:
-                                layer = random.choice(ritual_layers)
-                            outfit_items.append(layer)
+                    outfit_items = self._attach_matching_layer(outfit_items, ritual_layers, required, context)
                     outfits.append({
                         "type": "one_piece+layer" if len(outfit_items) == 2 else "one_piece",
                         "items": outfit_items,
@@ -520,23 +726,7 @@ class SmartOutfitRecommender:
                     used_top_ids.add(top["id"])
                     used_bottom_ids.add(bottom["id"])
                     outfit_items = [top, bottom]
-                    if (
-                        "layer" in required or "jacket" in required or "coat" in required or "blazer" in required or "sweater" in required or "cardigan" in required
-                        or context.get("needs_layer")
-                    ):
-                        if ritual_layers:
-                            matching_layers = [
-                                layer for layer in ritual_layers
-                                if set(layer["tags"]) & (set(top["tags"]) | set(bottom["tags"]))
-                            ]
-                            specific_layer_types = [kw for kw in ["jacket", "blazer", "sweater", "coat", "cardigan"] if kw in required]
-                            if specific_layer_types:
-                                matching_layers = [layer for layer in ritual_layers if any(kw in layer["tags"] for kw in specific_layer_types)]
-                            if matching_layers:
-                                layer = random.choice(matching_layers)
-                            else:
-                                layer = random.choice(ritual_layers)
-                            outfit_items.append(layer)
+                    outfit_items = self._attach_matching_layer(outfit_items, ritual_layers, required, context)
                     outfits.append({
                         "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
                         "items": outfit_items,
@@ -566,23 +756,7 @@ class SmartOutfitRecommender:
                     used_top_ids.add(top["id"])
                     used_bottom_ids.add(bottom["id"])
                     outfit_items = [top, bottom]
-                    if (
-                        "layer" in required or "jacket" in required or "coat" in required or "blazer" in required or "sweater" in required or "cardigan" in required
-                        or context.get("needs_layer")
-                    ):
-                        if formal_layers:
-                            matching_layers = [
-                                layer for layer in formal_layers
-                                if set(layer["tags"]) & (set(top["tags"]) | set(bottom["tags"]))
-                            ]
-                            specific_layer_types = [kw for kw in ["jacket", "blazer", "sweater", "coat", "cardigan"] if kw in required]
-                            if specific_layer_types:
-                                matching_layers = [layer for layer in formal_layers if any(kw in layer["tags"] for kw in specific_layer_types)]
-                            if matching_layers:
-                                layer = random.choice(matching_layers)
-                            else:
-                                layer = random.choice(formal_layers)
-                            outfit_items.append(layer)
+                    outfit_items = self._attach_matching_layer(outfit_items, formal_layers, required, context)
                     outfits.append({
                         "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
                         "items": outfit_items,
@@ -636,28 +810,8 @@ class SmartOutfitRecommender:
                 used_top_ids.add(top["id"])
                 used_bottom_ids.add(bottom["id"])
                 outfit_items = [top, bottom]
-                # --- UNIVERSAL LAYER LOGIC for party/wedding ---
-                # Expanded: add layer if explicitly requested or contextually needed
-                if (
-                    "layer" in required or
-                    any(kw in required for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"]) or
-                    context.get("needs_layer")
-                ):
-                    # Find matching layers by occasion and explicit keywords
-                    specific_layer_types = [kw for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"] if kw in required]
-                    matching_layers = []
-                    if specific_layer_types:
-                        matching_layers = [layer for layer in party_layers if any(kw in layer["tags"] for kw in specific_layer_types)]
-                    if not matching_layers:
-                        # Fallback: match by party tags
-                        matching_layers = [
-                            layer for layer in party_layers
-                            if set(layer["tags"]) & (set(top["tags"]) | set(bottom["tags"]))
-                        ]
-                    if not matching_layers and party_layers:
-                        matching_layers = party_layers
-                    if matching_layers:
-                        outfit_items.append(random.choice(matching_layers))
+                # Attach layer if needed (universal helper)
+                outfit_items = self._attach_matching_layer(outfit_items, party_layers, required, context)
                 outfits.append({
                     "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
                     "items": outfit_items,
@@ -679,25 +833,8 @@ class SmartOutfitRecommender:
                     available_one_pieces = party_one_pieces
                 selected_one_piece = random.choice(available_one_pieces)
                 outfit_items = [selected_one_piece]
-                # --- UNIVERSAL LAYER LOGIC for one-piece ---
-                if (
-                    "layer" in required or
-                    any(kw in required for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"]) or
-                    context.get("needs_layer")
-                ):
-                    specific_layer_types = [kw for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"] if kw in required]
-                    matching_layers = []
-                    if specific_layer_types:
-                        matching_layers = [layer for layer in party_layers if any(kw in layer["tags"] for kw in specific_layer_types)]
-                    if not matching_layers:
-                        matching_layers = [
-                            layer for layer in party_layers
-                            if set(layer["tags"]) & set(selected_one_piece["tags"])
-                        ]
-                    if not matching_layers and party_layers:
-                        matching_layers = party_layers
-                    if matching_layers:
-                        outfit_items.append(random.choice(matching_layers))
+                # Attach layer if needed (universal helper)
+                outfit_items = self._attach_matching_layer(outfit_items, party_layers, required, context)
                 outfits.insert(0, {  # Insert one-piece as first outfit
                     "type": "one_piece+layer" if len(outfit_items) == 2 else "one_piece",
                     "items": outfit_items,
@@ -716,49 +853,50 @@ class SmartOutfitRecommender:
             def is_strictly_formal(item):
                 tags = set(item.get("tags", []))
                 return (
-                    (tags & formal_tags)
-                    and not (tags & exclude_tags)
+                    (tags & formal_tags) and 
+                    not (tags & exclude_tags) and
+                    (item["category"] != "one_piece")  # Exclude one_pieces for formal office
                 )
-            formal_tops = [top for top in self.wardrobe_db if top["category"] == "topwear" and is_strictly_formal(top)]
-            formal_bottoms = [bottom for bottom in self.wardrobe_db if bottom["category"] == "bottomwear" and is_strictly_formal(bottom)]
-            formal_layers = [layer for layer in self.wardrobe_db if layer["category"] == "layer" and is_strictly_formal(layer)]
+
+            formal_tops = [top for top in self.wardrobe_db 
+                          if top["category"] == "topwear" and is_strictly_formal(top)]
+            formal_bottoms = [bottom for bottom in self.wardrobe_db 
+                             if bottom["category"] == "bottomwear" and is_strictly_formal(bottom)]
+            formal_layers = [layer for layer in self.wardrobe_db 
+                            if layer["category"] == "layer" and is_strictly_formal(layer)]
+
             outfits = []
             used_top_ids = set()
             used_bottom_ids = set()
+
             for _ in range(3):
                 available_tops = [top for top in formal_tops if top["id"] not in used_top_ids]
                 available_bottoms = [bottom for bottom in formal_bottoms if bottom["id"] not in used_bottom_ids]
+                
                 if not available_tops or not available_bottoms:
                     break
+                    
                 top = random.choice(available_tops)
                 bottom = random.choice(available_bottoms)
                 used_top_ids.add(top["id"])
                 used_bottom_ids.add(bottom["id"])
+                
                 outfit_items = [top, bottom]
-                # Add layer if requested or needed (expanded)
-                if (
-                    "layer" in required or
-                    any(kw in required for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"]) or
-                    context.get("needs_layer")
-                ):
-                    specific_layer_types = [kw for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"] if kw in required]
-                    matching_layers = []
-                    if specific_layer_types:
-                        matching_layers = [layer for layer in formal_layers if any(kw in layer["tags"] for kw in specific_layer_types)]
-                    if not matching_layers:
-                        matching_layers = [
-                            layer for layer in formal_layers
-                            if set(layer["tags"]) & (set(top["tags"]) | set(bottom["tags"]))
-                        ]
-                    if not matching_layers and formal_layers:
-                        matching_layers = formal_layers
-                    if matching_layers:
-                        outfit_items.append(random.choice(matching_layers))
+                
+                # STRICTLY FORMAL LAYER ATTACHMENT
+                if formal_layers:
+                    # Only add if not already present and we have matching formal layers
+                    if not any(item["category"] == "layer" for item in outfit_items):
+                        selected_layer = random.choice(formal_layers)
+                        outfit_items.append(selected_layer)
+                
                 outfits.append({
                     "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
                     "items": outfit_items,
-                    "reason": f"Formal/office outfit for {occasions}" + (" (with layer)" if len(outfit_items) == 3 else "")
+                    "reason": f"Formal/office outfit for {occasions}" + 
+                             (" (with formal layer)" if len(outfit_items) == 3 else "")
                 })
+
             return outfits[:3]
         # --- Ritual/Traditional logic (rituals, temple, home_ritual, ceremony, festival) ---
         elif any(occ in ritual_occasions for occ in [o.lower() for o in occasions]):
@@ -773,24 +911,8 @@ class SmartOutfitRecommender:
             if ritual_one_pieces:
                 selected_one_piece = random.choice(ritual_one_pieces)
                 outfit_items = [selected_one_piece]
-                if (
-                    "layer" in required or
-                    any(kw in required for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"]) or
-                    context.get("needs_layer")
-                ):
-                    specific_layer_types = [kw for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"] if kw in required]
-                    matching_layers = []
-                    if specific_layer_types:
-                        matching_layers = [layer for layer in ritual_layers if any(kw in layer["tags"] for kw in specific_layer_types)]
-                    if not matching_layers:
-                        matching_layers = [
-                            layer for layer in ritual_layers
-                            if set(layer["tags"]) & set(selected_one_piece["tags"])
-                        ]
-                    if not matching_layers and ritual_layers:
-                        matching_layers = ritual_layers
-                    if matching_layers:
-                        outfit_items.append(random.choice(matching_layers))
+                # Attach layer if needed (universal helper)
+                outfit_items = self._attach_matching_layer(outfit_items, ritual_layers, required, context)
                 outfits.append({
                     "type": "one_piece+layer" if len(outfit_items) == 2 else "one_piece",
                     "items": outfit_items,
@@ -809,24 +931,8 @@ class SmartOutfitRecommender:
                 used_top_ids.add(top["id"])
                 used_bottom_ids.add(bottom["id"])
                 outfit_items = [top, bottom]
-                if (
-                    "layer" in required or
-                    any(kw in required for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"]) or
-                    context.get("needs_layer")
-                ):
-                    specific_layer_types = [kw for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"] if kw in required]
-                    matching_layers = []
-                    if specific_layer_types:
-                        matching_layers = [layer for layer in ritual_layers if any(kw in layer["tags"] for kw in specific_layer_types)]
-                    if not matching_layers:
-                        matching_layers = [
-                            layer for layer in ritual_layers
-                            if set(layer["tags"]) & (set(top["tags"]) | set(bottom["tags"]))
-                        ]
-                    if not matching_layers and ritual_layers:
-                        matching_layers = ritual_layers
-                    if matching_layers:
-                        outfit_items.append(random.choice(matching_layers))
+                # Attach layer if needed (universal helper)
+                outfit_items = self._attach_matching_layer(outfit_items, ritual_layers, required, context)
                 outfits.append({
                     "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
                     "items": outfit_items,
@@ -863,25 +969,8 @@ class SmartOutfitRecommender:
                 used_top_ids.add(top["id"])
                 used_bottom_ids.add(bottom["id"])
                 outfit_items = [top, bottom]
-                # --- UNIVERSAL LAYER LOGIC ---
-                if (
-                    "layer" in required or
-                    any(kw in required for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"]) or
-                    context.get("needs_layer")
-                ):
-                    specific_layer_types = [kw for kw in ["jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"] if kw in required]
-                    matching_layers = []
-                    if specific_layer_types:
-                        matching_layers = [layer for layer in candidate_layers if any(kw in layer["tags"] for kw in specific_layer_types)]
-                    if not matching_layers:
-                        matching_layers = [
-                            layer for layer in candidate_layers
-                            if set(layer["tags"]) & (set(top["tags"]) | set(bottom["tags"]))
-                        ]
-                    if not matching_layers and candidate_layers:
-                        matching_layers = candidate_layers
-                    if matching_layers:
-                        outfit_items.append(random.choice(matching_layers))
+                # Attach layer if needed (universal helper)
+                outfit_items = self._attach_matching_layer(outfit_items, candidate_layers, required, context)
                 outfits.append({
                     "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
                     "items": outfit_items,
@@ -916,10 +1005,13 @@ class SmartOutfitRecommender:
                     used_ids = set()
                     for op in sport_one_pieces:
                         if op["id"] not in used_ids:
+                            outfit_items = [op]
+                            # Attach layer if needed (universal helper)
+                            outfit_items = self._attach_matching_layer(outfit_items, sport_layers, required, context)
                             outfits.append({
-                                "type": "one_piece",
-                                "items": [op],
-                                "reason": "Swimwear (one-piece) for swimming"
+                                "type": "one_piece+layer" if len(outfit_items) == 2 else "one_piece",
+                                "items": outfit_items,
+                                "reason": "Swimwear (one-piece) for swimming" + (" (with layer)" if len(outfit_items) == 2 else "")
                             })
                             used_ids.add(op["id"])
                             if len(outfits) == 3:
@@ -933,10 +1025,13 @@ class SmartOutfitRecommender:
                         for t, b in combos:
                             combo_key = (t["id"], b["id"])
                             if combo_key not in used_combo_ids:
+                                outfit_items = [t, b]
+                                # Attach layer if needed (universal helper)
+                                outfit_items = self._attach_matching_layer(outfit_items, sport_layers, required, context)
                                 outfits.append({
-                                    "type": "top+bottom",
-                                    "items": [t, b],
-                                    "reason": "Swim-appropriate separates"
+                                    "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
+                                    "items": outfit_items,
+                                    "reason": "Swim-appropriate separates" + (" (with layer)" if len(outfit_items) == 3 else "")
                                 })
                                 used_combo_ids.add(combo_key)
                                 if len(outfits) == 3:
@@ -950,12 +1045,12 @@ class SmartOutfitRecommender:
                 random.shuffle(combos)
                 for t, b in combos:
                     outfit_items = [t, b]
-                    if context.get("needs_layer") and sport_layers:
-                        outfit_items.append(random.choice(sport_layers))
+                    # Attach layer if needed (universal helper)
+                    outfit_items = self._attach_matching_layer(outfit_items, sport_layers, required, context)
                     outfits.append({
-                        "type": "top+bottom",
+                        "type": "top+bottom+layer" if len(outfit_items) == 3 else "top+bottom",
                         "items": outfit_items,
-                        "reason": f"{key.title()} outfit: {t['name']} + {b['name']}"
+                        "reason": f"{key.title()} outfit: {t['name']} + {b['name']}" + (" (with layer)" if len(outfit_items) == 3 else "")
                     })
                     if len(outfits) == 3:
                         break
@@ -966,30 +1061,29 @@ class SmartOutfitRecommender:
         # --- UNIVERSAL LAYER ATTACHMENT LOGIC ---
         layer_keywords = ["layer", "jacket", "blazer", "sweater", "coat", "cardigan", "overcoat", "wrap"]
         requested_layer_types = [kw for kw in layer_keywords if kw in required]
-        if requested_layer_types:
+        # PATCH: Also run this block if "layer" is in required (not just specific types)
+        if requested_layer_types or "layer" in required:
             all_layers = [item for item in self.wardrobe_db if item["category"] == "layer"]
             for outfit in outfits:
                 has_layer = any(item["category"] == "layer" for item in outfit["items"])
                 if not has_layer:
-                    # Try to find a matching layer by requested type and party/occasion tags
                     matching_layers = []
-                    # 1. Match both requested type and "party" (or occasion) tag
                     outfit_tags = set()
                     for item in outfit["items"]:
                         outfit_tags.update(item.get("tags", []))
                     # Try to match requested type and any of the outfit's tags (especially "party")
-                    matching_layers = [
-                        layer for layer in all_layers
-                        if any(kw in layer["tags"] for kw in requested_layer_types)
-                        and (set(layer["tags"]) & outfit_tags)
-                    ]
-                    # 2. If not found, match only requested type
-                    if not matching_layers:
+                    if requested_layer_types:
                         matching_layers = [
                             layer for layer in all_layers
                             if any(kw in layer["tags"] for kw in requested_layer_types)
+                            and (set(layer["tags"]) & outfit_tags)
                         ]
-                    # 3. If still not found, match any layer
+                        if not matching_layers:
+                            matching_layers = [
+                                layer for layer in all_layers
+                                if any(kw in layer["tags"] for kw in requested_layer_types)
+                            ]
+                    # If only "layer" is requested, just use all layers
                     if not matching_layers and all_layers:
                         matching_layers = all_layers
                     if matching_layers:
@@ -1000,9 +1094,15 @@ class SmartOutfitRecommender:
                         else:
                             outfit["type"] = "with_layer"
                         if "reason" in outfit:
-                            outfit["reason"] += " (with " + ", ".join(requested_layer_types) + ")"
+                            if requested_layer_types:
+                                outfit["reason"] += " (with " + ", ".join(requested_layer_types) + ")"
+                            else:
+                                outfit["reason"] += " (with layer)"
                         else:
-                            outfit["reason"] = "Includes " + ", ".join(requested_layer_types)
+                            if requested_layer_types:
+                                outfit["reason"] = "Includes " + ", ".join(requested_layer_types)
+                            else:
+                                outfit["reason"] = "Includes layer"
         return outfits[:3]
 
     def recommend_outfits(self, prompt: str) -> Dict:
@@ -1018,6 +1118,8 @@ class SmartOutfitRecommender:
         ):
             relaxed_outfits = self.get_unique_outfits(occasions, context, [], forbidden)
             outfits.extend(relaxed_outfits[:3-len(outfits)])
+        # Prioritize color-matching outfits
+        outfits = self._prioritize_color_outfits(outfits, required)
         return {
             "occasion": " & ".join(occasions),
             "outfits": outfits[:3],
@@ -1241,7 +1343,6 @@ wardrobe_db =  [
             {"id": "DRSM09149", "name": "layer22", "category": "layer", "tags": ["party", "fancy", "elegant", "silk", "cotton","cream","white","blazer"], "image": "DRSM09149.jpeg"},
             {"id": "DRSM09150", "name": "layer23", "category": "layer", "tags": ["party", "fancy", "elegant", "silk", "cotton","violet","purple","lavender","blazer"], "image": "DRSM09150.jpeg"},
             {"id": "DRSM09151", "name": "layer24", "category": "layer", "tags": ["cotton","black","formal","office","blazer","warm"], "image": "DRSM09151.jpeg"},
-            {"id": "DRSM09152", "name": "layer25", "category": "layer", "tags": ["party", "fancy", "elegant", "warm", "cotton","pink","light","blazer"], "image": "DRSM09152.jpeg"},
             {"id": "DRSM09153", "name": "bottom1", "category": "bottomwear", "tags": ["party","cotton", "pink","light","fancy","elegant","date"], "image": "DRSM09153.jpeg"},
             {"id": "DRSM09154", "name": "bottom2", "category": "bottomwear", "tags": ["party","cotton", "green","light","fancy","elegant","olive","date"], "image": "DRSM09154.jpeg"},
             {"id": "DRSM09155", "name": "topwear21", "category": "topwear", "tags": ["casual", "top", "shopping", "outing", "white","cream","cotton","picnic"], "image": "DRSM09155.jpeg"},
